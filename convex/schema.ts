@@ -11,4 +11,12 @@ export default defineSchema({
     text: v.string(),
     isCompleted: v.boolean(),
   }),
+
+  sessions: defineTable({
+    userId: v.id("users"),
+    token: v.string(),
+    expiresAt: v.number(),
+  })
+    .index("by_token", ["token"])
+    .index("by_expiresAt", ["expiresAt"]),
 });

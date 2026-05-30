@@ -1,104 +1,67 @@
 /**
- * src/lib/auth.ts
+ * src/lib/auth.ts — the unified entry point for auth.
  *
- * Everything non-action lives here. The goal is that you can read this file
- * top-to-bottom and understand the entire session story: validation, JWT
- * signing/verifying, the session cookie, and the DAL helper that protected
- * pages call.
+ * Two strategies live in `auth-jwt.ts` and `auth-session.ts`. This file
+ * picks one based on the AUTH_STRATEGY env var and exposes a small set of
+ * helpers that the Server Actions, proxy, and protected pages all use
+ * without ever mentioning a strategy name.
  *
- * Trust boundary: Next.js. The JWT is signed and verified here with a server
- * secret. The cookie is `httpOnly` so client JS cannot read or forge it.
+ *   AUTH_STRATEGY=jwt      → stateless, signed token in the cookie
+ *   AUTH_STRATEGY=session  → opaque token in the cookie, row in Convex
+ *
+ * To flip strategies: edit .env.local, restart `npm run dev`. The rest of
+ * the application is unaware of which one is active.
  */
-
-import { jwtVerify, SignJWT } from "jose";
-import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { cache } from "react";
-import { z } from "zod";
-import type { Id } from "../../convex/_generated/dataModel";
+import { jwtStrategy } from "./auth-jwt";
+import { sessionStrategy } from "./auth-session";
+import type { SessionPayload, SessionStrategy } from "./auth-shared";
 
-export const SESSION_COOKIE = "session";
+// Re-exports so callers only ever import from `@/lib/auth`.
+export {
+  type AuthResult,
+  credentialsSchema,
+  SESSION_COOKIE,
+  type SessionPayload,
+  type SessionStrategy,
+} from "./auth-shared";
 
-// 7 days. Stateless JWT — there is no server-side revocation, only expiry.
-const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 7;
+const RAW_STRATEGY = process.env.AUTH_STRATEGY ?? "jwt";
 
-/**
- * Validation runs at the trust boundary (Server Action). Reject malformed
- * input before it ever reaches Convex or the password hasher.
- */
-export const credentialsSchema = z.object({
-  email: z.email("Invalid email"),
-  password: z.string().min(8, "Password must be at least 8 characters"),
-});
-
-export type SessionPayload = { userId: Id<"users">; email: string };
-
-/**
- * Lazily load the secret so a missing AUTH_SECRET surfaces a clear error at
- * first auth attempt instead of at module import.
- */
-function getSecret(): Uint8Array {
-  const s = process.env.AUTH_SECRET;
-  if (!s || s.length < 32) {
-    throw new Error(
-      "AUTH_SECRET must be set in .env.local and be at least 32 characters. " +
-        "Generate one with: openssl rand -base64 32",
-    );
-  }
-  return new TextEncoder().encode(s);
+if (RAW_STRATEGY !== "jwt" && RAW_STRATEGY !== "session") {
+  // Fail loud at module load — silently defaulting after a typo would be
+  // worse than crashing the dev server with a clear message.
+  throw new Error(
+    `AUTH_STRATEGY must be "jwt" or "session" (got "${RAW_STRATEGY}"). ` +
+      "Set it in .env.local.",
+  );
 }
 
+export const AUTH_STRATEGY: "jwt" | "session" = RAW_STRATEGY;
+
 /**
- * Sign the JWT and stamp it into the session cookie. Only callable from a
- * Server Action or Route Handler — Server Components cannot mutate cookies.
+ * The active strategy. Server Actions and the DAL talk to this and only
+ * this — the underlying jwt/session split is invisible to them.
  */
-export async function createSessionCookie(
-  payload: SessionPayload,
-): Promise<void> {
-  const token = await new SignJWT({ ...payload })
-    .setProtectedHeader({ alg: "HS256" })
-    .setIssuedAt()
-    .setExpirationTime(`${SESSION_MAX_AGE_SECONDS}s`)
-    .sign(getSecret());
-
-  const jar = await cookies();
-  jar.set(SESSION_COOKIE, token, {
-    httpOnly: true, // browser JS cannot read the cookie → XSS can't steal the token
-    secure: process.env.NODE_ENV === "production", // HTTPS-only in prod
-    sameSite: "lax", // blocks cross-site POST CSRF, allows top-level link nav
-    path: "/",
-    maxAge: SESSION_MAX_AGE_SECONDS,
-  });
-}
-
-export async function clearSessionCookie(): Promise<void> {
-  (await cookies()).delete(SESSION_COOKIE);
-}
+export const currentStrategy: SessionStrategy =
+  AUTH_STRATEGY === "session" ? sessionStrategy : jwtStrategy;
 
 /**
- * The DAL — Data Access Layer call protected pages make to learn who is
- * signed in. Wrapped in React `cache()` so it dedupes per render: a layout
- * and its child page both calling `verifySession()` only verify the JWT once.
+ * The DAL — the call protected pages make to learn who is signed in.
+ * Wrapped in React `cache()` so the work happens at most once per render
+ * even if both the layout and the page call it.
  *
- * Fails closed: any invalid/expired/tampered token returns null.
+ * Fails closed for every kind of failure (no cookie, expired, bad
+ * signature, deleted user, stale value from a strategy flip).
  */
 export const verifySession = cache(async (): Promise<SessionPayload | null> => {
-  const token = (await cookies()).get(SESSION_COOKIE)?.value;
-  if (!token) return null;
-  try {
-    const { payload } = await jwtVerify(token, getSecret());
-    return {
-      userId: payload.userId as Id<"users">,
-      email: payload.email as string,
-    };
-  } catch {
-    return null;
-  }
+  return currentStrategy.getSession();
 });
 
 /**
- * For Server Components that *require* a signed-in user. `redirect()` throws
- * a NEXT_REDIRECT error — never wrap this in try/catch.
+ * For Server Components that REQUIRE a signed-in user. `redirect()`
+ * throws a NEXT_REDIRECT error — never wrap this call in try/catch.
  */
 export async function requireSession(): Promise<SessionPayload> {
   const session = await verifySession();

@@ -2,23 +2,32 @@
 
 A from-scratch auth system on **Next.js 16 (App Router) + Convex DB**. No NextAuth, no Clerk, no Better Auth — every primitive (hashing, JWT signing, cookie semantics, session retrieval, protected routes) is hand-written so the flow is fully traceable.
 
-This document is the single reference for the feature: what was built, how each flow works, what corners were intentionally cut, and what's worth adding next.
+**Two interchangeable strategies** live side-by-side:
+
+- `AUTH_STRATEGY=jwt` — stateless: cookie holds a signed JWT, no DB read on session verification.
+- `AUTH_STRATEGY=session` — stateful: cookie holds an opaque random token, every protected page does one Convex lookup against a `sessions` table.
+
+Switching is a one-line edit to `.env.local` + a dev-server restart. The rest of the application (Server Actions, proxy, protected pages) is unaware of which is active.
 
 ---
 
-## 1. What we built
+## 1. What's in the box
 
 | Capability | Where it lives |
 | --- | --- |
-| Sign up (email + password) | `src/app/signup/` → `signUpAction` in `src/app/actions.ts` → `api.auth.signUp` in `convex/auth.ts` |
-| Sign in | `src/app/signin/` → `signInAction` → `api.auth.signIn` |
-| Sign out | `signOutAction` → cookie delete |
-| JWT session | `jose` HS256 token in an `httpOnly` cookie, 7-day expiry |
-| Session retrieval | `verifySession()` DAL in `src/lib/auth.ts` (wrapped in React `cache()`) |
-| Protected routes | `requireSession()` on the page + optimistic check in `src/proxy.ts` |
+| Sign up (email + password) | `src/app/signup/` → `signUpAction` → `currentStrategy.signUp` → `api.auth.signUp` |
+| Sign in | `src/app/signin/` → `signInAction` → `currentStrategy.signIn` → `api.auth.signIn` |
+| Sign out | `signOutAction` → `currentStrategy.signOut` |
+| JWT strategy | `src/lib/auth-jwt.ts` — `jose` HS256 token in an `httpOnly` cookie, 7-day expiry |
+| Session strategy | `src/lib/auth-session.ts` — opaque 32-byte random token in cookie, row in `sessions` table |
+| Strategy switch | `AUTH_STRATEGY` env var, validated at module load in `src/lib/auth.ts` |
+| Session retrieval | `verifySession()` DAL — delegates to `currentStrategy.getSession()`, wrapped in React `cache()` |
+| Protected routes | `requireSession()` on the page + optimistic cookie-presence check in `src/proxy.ts` |
 | Password hashing | `bcryptjs`, cost factor 10, runs inside a Convex Node action |
 | Validation | `zod` schemas at the Server Action boundary |
 | User persistence | `users` table in Convex with a `by_email` index |
+| Session persistence | `sessions` table with `by_token` and `by_expiresAt` indexes |
+| Expired session cleanup | Daily Convex cron: `internal.sessions.deleteExpired` |
 
 ---
 
@@ -27,46 +36,74 @@ This document is the single reference for the feature: what was built, how each 
 ```
 src/
   lib/
-    auth.ts                  # Zod schemas, JWT sign/verify, cookie config,
-                             # verifySession() DAL, requireSession() helper
+    auth.ts                  # entry point: picks strategy from env, re-exports
+                             # verifySession + requireSession
+    auth-shared.ts           # types, Zod schemas, cookie config, getSecret —
+                             # shared by both strategies, lives in its own
+                             # file to avoid a circular import
+    auth-jwt.ts              # jwtStrategy implementation
+    auth-session.ts          # sessionStrategy implementation
   app/
     actions.ts               # "use server": signUpAction, signInAction, signOutAction
+                             # — all just delegate to currentStrategy
     page.tsx                 # public landing
-    signin/
-      page.tsx               # server component
-      form.tsx               # "use client": useActionState form
-    signup/
-      page.tsx
-      form.tsx
-    dashboard/
-      page.tsx               # protected; calls requireSession(); shows tasks
-      sign-out-button.tsx    # "use client": form calling signOutAction
-    ConvexClientProvider.tsx # existing Convex client wrapper
-    layout.tsx               # existing root layout
-  proxy.ts                   # Next.js 16 proxy (renamed from middleware) —
-                             # optimistic cookie-presence redirect
+    signin/page.tsx + form.tsx
+    signup/page.tsx + form.tsx
+    dashboard/page.tsx + sign-out-button.tsx
+    ConvexClientProvider.tsx
+    layout.tsx
+  proxy.ts                   # Next.js 16 proxy — optimistic cookie-presence
+                             # redirect on /dashboard
 
 convex/
-  schema.ts                  # users + tasks tables
+  schema.ts                  # users + tasks + sessions tables
   users.ts                   # internal getByEmail / insertUser
-  auth.ts                    # "use node": signUp + signIn actions (bcryptjs)
+  sessions.ts                # internal insert + public getByToken /
+                             # deleteByToken + internal deleteExpired
+  auth.ts                    # "use node" — public signUp + signIn actions
+                             # (bcryptjs). Both take an optional `session`
+                             # arg so the row insert is atomic with the
+                             # password verification.
+  crons.ts                   # daily cron calling internal.sessions.deleteExpired
   tasks.ts                   # demo query, surfaced on /dashboard
 ```
 
-**Design rule we kept:** few files, dense files. The whole story is in `src/lib/auth.ts` + `src/app/actions.ts` + the three Convex files. No utility folders, no `helpers/`, no `services/`.
+**Design rule:** few dense files. The whole strategy story is in `src/lib/auth.ts` + the three sibling files + four Convex files. No utility folders, no helper soup.
 
 ---
 
-## 3. Tech stack & library choices
+## 3. The strategy interface
 
-| Concern | Library | Why |
-| --- | --- | --- |
-| Password hashing | **`bcryptjs`** | Pure-JS port of bcrypt; runs fine in Convex's Node action runtime. Industry standard. Cost 10 (~100ms) — slow enough to frustrate brute force, fast enough not to hit Convex action timeouts. |
-| JWT signing/verifying | **`jose`** | Modern, well-maintained, Web Crypto-based, the de-facto choice in the App Router auth docs. We use HS256 with a 32-byte shared secret (`AUTH_SECRET`). |
-| Input validation | **`zod`** v4 | Runs at the trust boundary (Server Action) so malformed input never reaches Convex or the hasher. |
-| Calling Convex from Next.js server | **`convex/nextjs`** (`fetchAction`, `fetchQuery`) | Idiomatic server-side Convex calls from Server Actions and Server Components. |
+One type, four methods, two implementations.
 
-Versions installed: `bcryptjs@3.0.3`, `jose@6.2.3`, `zod@4.4.3`, `convex@1.39.1`, `next@16.2.6`.
+```ts
+// src/lib/auth-shared.ts
+export type SessionPayload = { userId: Id<"users">; email: string };
+export type AuthResult =
+  | { ok: true; session: SessionPayload }
+  | { ok: false; error: string };
+
+export type SessionStrategy = {
+  signUp(creds): Promise<AuthResult>;
+  signIn(creds): Promise<AuthResult>;
+  signOut(): Promise<void>;
+  getSession(): Promise<SessionPayload | null>;
+};
+```
+
+Why four methods instead of three (`createSession` / `getSession` / `clearSession`)?
+
+Because for the session strategy the password check and the row insert **must** be the same Convex call. Splitting them would require a public Convex endpoint `createSession({userId, token})` — at which point anyone with the deployment URL can mint a session for any user without knowing the password. Folding sign-up/sign-in into the strategy keeps that invariant atomic.
+
+`currentStrategy` is picked once at module load:
+
+```ts
+// src/lib/auth.ts
+const RAW = process.env.AUTH_STRATEGY ?? "jwt";
+if (RAW !== "jwt" && RAW !== "session") throw new Error(...);
+export const currentStrategy =
+  RAW === "session" ? sessionStrategy : jwtStrategy;
+```
 
 ---
 
@@ -79,233 +116,227 @@ users: defineTable({
   passwordHash: v.string(),  // bcrypt hash; never leaves Convex
 }).index("by_email", ["email"]),
 
-tasks: defineTable({
-  text: v.string(),
-  isCompleted: v.boolean(),
-}),
+sessions: defineTable({
+  userId: v.id("users"),     // foreign key
+  token: v.string(),         // 32-byte random, base64url — the cookie value
+  expiresAt: v.number(),     // epoch ms
+})
+  .index("by_token", ["token"])         // O(1) lookup on every request
+  .index("by_expiresAt", ["expiresAt"]),// cron sweep
+
+tasks: defineTable({ ... }),
 ```
 
-- `_id` and `_creationTime` are Convex system fields, automatically added.
-- We **store email lowercased** at write time so `Foo@x.com` and `foo@x.com` cannot create duplicate accounts. Display case is lost — acceptable for a learning project.
-- `passwordHash` is never returned by any Convex function called from outside Convex. The bcrypt comparison happens *inside* the `signIn` action; only the resulting `{ userId, email }` crosses the wire.
-- The `tasks` table is unrelated to auth — it's the existing demo data used on `/dashboard` to show "a protected page that loads data" end-to-end.
+- `sessions` is unused when `AUTH_STRATEGY=jwt` — JWT is stateless.
+- `passwordHash` is never returned by any Convex function called from outside Convex.
+- `_id` and `_creationTime` are Convex system fields.
 
 ---
 
-## 5. Architecture & trust boundary
+## 5. The strategy switch (`AUTH_STRATEGY`)
+
+A single env var in `.env.local`, server-only (no `NEXT_PUBLIC_` prefix):
 
 ```
-┌────────────── Next.js (trust boundary) ──────────────┐    ┌─── Convex ───┐
-│                                                      │    │              │
-│  Browser ── form POST ──> Server Action              │    │  schema      │
-│                              │                       │    │   users      │
-│                              ├─ Zod validate         │    │              │
-│                              ├─ fetchAction ─────────┼────┼─> auth.ts    │
-│                              │                       │    │   (use node) │
-│                              │                       │    │   bcryptjs   │
-│                              │                       │    │     │        │
-│                              │                       │    │     v        │
-│                              │                       │    │  users.ts    │
-│                              │                       │    │  internal-   │
-│                              │  <─── userId, email ──┼────┼─ Query /     │
-│                              │                       │    │  internal-   │
-│                              │                       │    │  Mutation    │
-│                              ├─ mint JWT (jose)      │    └──────────────┘
-│                              ├─ cookies().set(...)   │
-│                              └─ redirect /dashboard  │
-│                                                      │
-│  Protected page ─> verifySession() ─> cookies().get  │
-│                    └─ jose.verify ─> { userId, email}│
-│                                                      │
-│  proxy.ts ─> optimistic cookie-presence check        │
-│              └─> redirect /signin if missing         │
-└──────────────────────────────────────────────────────┘
+AUTH_STRATEGY=jwt        # or `session`
 ```
 
-**Where does trust live?** In the Next.js server.
+Read at module load by `src/lib/auth.ts`. Unknown values throw immediately — fail loud, not silent. Default if unset: `jwt`.
 
-- The JWT is signed and verified entirely there with `AUTH_SECRET`.
-- The cookie is `httpOnly`, so browser JS cannot read or forge it.
-- Convex is treated as **storage + a place to run bcrypt** (because bcryptjs needs a Node runtime, and Convex actions provide one).
-- We did **not** wire up `convex/auth.config.ts` / JWKS / `ConvexProviderWithAuth`. That route is more "correct" for production but adds RS256 keys, a `/.well-known/jwks.json` endpoint, and a `useAuth` hook — obscuring the auth fundamentals the project is teaching.
+**What changes when you flip the flag**
 
-**Consequence:** `auth.signUp` and `auth.signIn` are *public* Convex actions (anyone with the deployment URL can call them — which is fine for sign-up/sign-in, those are inherently public). The actual user CRUD (`users.getByEmail`, `users.insertUser`) is **`internalQuery`/`internalMutation`** and is only reachable from inside Convex.
-
----
-
-## 6. Flow walkthroughs
-
-### 6.1 Sign-up flow
-
-1. `POST` from `<SignUpForm />` (a `"use client"` component using `useActionState`) hits `signUpAction` in `src/app/actions.ts`.
-2. Zod parses `{ email, password }`. If invalid → return `{ error: "..." }` and the form re-renders with the message.
-3. `fetchAction(api.auth.signUp, parsed.data)` calls the Convex action.
-   - The action lowercases the email.
-   - Looks up duplicates via `internal.users.getByEmail`. If hit → throws `ConvexError("Email already in use")`.
-   - Hashes the password with bcrypt cost 10.
-   - Calls `internal.users.insertUser`.
-   - Returns `{ userId, email }`.
-4. Back in the Server Action: `createSessionCookie({ userId, email })` signs the JWT and writes the `session` cookie.
-5. `redirect("/dashboard")` — sent **outside** the `try/catch` because `redirect()` throws an internal `NEXT_REDIRECT` error; catching it would silently break the redirect.
-
-### 6.2 Sign-in flow
-
-1. Same form pattern.
-2. `fetchAction(api.auth.signIn, parsed.data)` in Convex:
-   - Looks up by email (lowercased).
-   - **Timing-equalized**: if no user, still bcrypt-compares against a dummy hash so attackers can't enumerate accounts by measuring response time.
-   - Returns `{ userId, email }` or `null`.
-3. If `null` → `{ error: "Invalid email or password" }`. We deliberately don't tell the caller *which* was wrong, since that leaks account existence.
-4. Otherwise mint JWT → set cookie → redirect.
-
-### 6.3 Session retrieval (every protected render)
-
-The DAL lives in `src/lib/auth.ts`:
-
-```ts
-export const verifySession = cache(async (): Promise<SessionPayload | null> => {
-  const token = (await cookies()).get(SESSION_COOKIE)?.value;
-  if (!token) return null;
-  try {
-    const { payload } = await jwtVerify(token, getSecret());
-    return { userId: payload.userId as Id<"users">, email: payload.email as string };
-  } catch {
-    return null;  // fail closed on tampered/expired tokens
-  }
-});
-```
-
-- `cache()` from `react` dedupes the call per render — even if a layout *and* its child page both call `verifySession()`, the JWT is verified once.
-- `requireSession()` is the variant that calls `redirect("/signin")` when missing — used by `/dashboard/page.tsx`.
-
-Because we put `email` *inside* the JWT, "who am I" reads zero rows from the database on every page load. The token is the source of truth for the session.
-
-### 6.4 Proxy flow (Next.js 16 — formerly middleware)
-
-```ts
-// src/proxy.ts
-export const config = { matcher: ["/dashboard/:path*"] };
-```
-
-- Next.js 16 renamed `middleware.ts` → `proxy.ts`. It runs on the Node.js runtime by default (no more Edge constraint).
-- Our proxy does **only** an optimistic check — does the `session` cookie exist? If not, redirect to `/signin`. It does **not** verify the JWT signature.
-- The actual security check is `verifySession()` on the protected page itself. The proxy is for UX (don't even attempt to render the protected route for obviously-unauthenticated users).
-- This is the pattern the Next.js auth guide recommends in v16: cheap proxy + thorough DAL.
-
-### 6.5 Sign-out flow
-
-```ts
-export async function signOutAction(): Promise<void> {
-  await clearSessionCookie();
-  redirect("/signin");
-}
-```
-
-That's the entire implementation. Stateless JWT means there's no server-side session to destroy — we just remove the cookie from this browser and the user is logged out *for this device*.
-
-The token itself remains technically valid until expiry — see Drawbacks #1.
-
----
-
-## 7. Security considerations
-
-| Threat | Mitigation in this code |
+| Thing | When you toggle from jwt → session |
 | --- | --- |
-| **XSS stealing the session token** | Cookie is `httpOnly` → not readable by JavaScript. |
-| **CSRF on auth endpoints** | Cookie is `sameSite: 'lax'` → blocks cross-site POSTs. Server Actions are POST-based and same-origin. |
-| **Token tampering / forged JWTs** | Verified with `jose.jwtVerify(token, AUTH_SECRET)`. Any signature mismatch returns `null` → treated as anonymous. |
-| **Brute-force password guessing** | bcrypt cost 10 (~100ms per attempt). Slow enough that offline cracking is expensive too. |
-| **Account enumeration via timing** | Sign-in compares against a dummy bcrypt hash when the email is unknown, so response time is roughly constant. |
-| **Account enumeration via error messages** | Sign-in only ever returns `"Invalid email or password"`. The two failure modes are indistinguishable to the caller. |
-| **Password hash leakage** | `passwordHash` never leaves Convex. The bcrypt compare runs inside the Convex action; only `{ userId, email }` is returned. |
-| **Bad input reaching the database** | Zod parses every form payload at the Server Action boundary before anything else runs. |
-| **Direct database access** | `users.getByEmail` and `users.insertUser` are `internalQuery`/`internalMutation` — unreachable from the public internet. |
-| **Transport** | Cookie is `secure: true` in production (HTTPS only). Not enforced in dev so localhost works. |
-| **Secret strength** | `AUTH_SECRET` is required to be ≥ 32 characters; the code throws a clear error otherwise. Generate with `openssl rand -base64 32` or the equivalent PowerShell one-liner. |
+| `src/app/actions.ts` | No change |
+| `src/proxy.ts` | No change |
+| `src/app/dashboard/page.tsx` and all protected pages | No change |
+| Cookie name | Still `session` |
+| Cookie *contents* | JWT string → 43-char opaque token |
+| What runs on `verifySession()` | `jose.jwtVerify(token, AUTH_SECRET)` → one Convex query |
+| Sign-out | Cookie delete only → cookie delete + DB row delete |
+| Revocation | None → immediate |
+| `sessions` table | Unused → one row per active session, daily cleanup cron |
+| `AUTH_SECRET` requirement | Required → ignored (no JWT to sign) |
+| Existing sessions across the flip | All current cookies become invalid; users get bounced to `/signin` on next request (cookie shape no longer matches the verifier). Intentional. |
+
+To switch: edit `.env.local`, restart `npm run dev`.
 
 ---
 
-## 8. Drawbacks / known limitations
+## 6. Flow walkthroughs — side by side
 
-> These are **intentional** trade-offs for an educational project, not bugs. Each one is the price of staying simple.
+### Sign-up / sign-in
 
-1. **No revocation.** A stateless JWT is valid until it expires. Sign-out deletes the cookie on *this* browser, but if the token was copied elsewhere it still works for up to 7 days. **Real-world fix:** a `sessions` table — the cookie stores a session id, every request looks it up, sign-out deletes the row.
+| Step | JWT | Session |
+| --- | --- | --- |
+| 1 | Form submits, Server Action Zod-parses input | same |
+| 2 | `currentStrategy.signUp({email, password})` | `currentStrategy.signUp({email, password})` |
+| 3 | `fetchAction(api.auth.signUp, creds)` — Convex bcrypt-hashes, inserts user, returns `{userId, email}` | same call BUT with `session: { token, expiresAt }` — Convex also inserts the session row in the same action |
+| 4 | Mint JWT (`jose.SignJWT`, HS256, 7-day exp), sign with `AUTH_SECRET` | Token was already generated with `crypto.randomBytes(32)`; no signing |
+| 5 | Cookie `session=<jwt>` (~200+ chars) | Cookie `session=<43-char opaque>` |
+| 6 | `redirect("/dashboard")` | same |
 
-2. **No refresh / sliding window.** The session is a single 7-day JWT. The user gets logged out exactly 7 days after sign-in regardless of activity. **Real-world fix:** issue a short-lived access token + long-lived refresh token, refresh transparently on each request.
+### Read session on every protected page render
 
-3. **No rate limiting.** `api.auth.signIn` is a public Convex action. An attacker can hit it directly with the deployment URL, bypassing any Next.js-side rate limit. bcrypt cost 10 slows them down but does not stop them. **Real-world fix:** a token-bucket counter keyed by IP + email in a small Convex table, rejecting requests above a threshold.
+| Step | JWT | Session |
+| --- | --- | --- |
+| 1 | Page calls `requireSession()` → `verifySession()` → `currentStrategy.getSession()` | same |
+| 2 | Read `session` cookie | same |
+| 3 | `jose.jwtVerify(token, AUTH_SECRET)` — **CPU only, no I/O** | `fetchQuery(api.sessions.getByToken, { token })` — **one indexed Convex read** |
+| 4 | Return `{userId, email}` from JWT payload, or `null` on any verification failure | Returns `{userId, email}` from the joined sessions+users row, or `null` if not found / expired / user deleted |
 
-4. **No email verification.** Sign-up trusts that the email belongs to whoever typed it. **Real-world fix:** issue a tokenized verification link, gate sign-in (or some features) on `emailVerifiedAt`.
+This is the **central trade-off**: JWT reads zero rows; session reads one row, every page.
 
-5. **No password reset.** A forgotten password is unrecoverable. **Real-world fix:** a "forgot password" flow that emails a short-lived single-use reset token.
+React `cache()` dedupes per render — calling `verifySession()` from the layout AND the page only runs the cookie/verify path once.
 
-6. **Email case is normalized at write.** `Foo@x.com` is stored as `foo@x.com`. The user's original case is not preserved. Fine for learning, slightly user-hostile in production.
+### Sign-out
 
-7. **Race window on sign-up duplicate check.** The "is this email already taken?" lookup and the insert happen in two separate `ctx.run*` calls. Two simultaneous sign-ups with the same email could both pass the check and both insert. The probability is extremely low in practice. **Real-world fix:** Convex doesn't support unique constraints; the safer pattern is an idempotent insert + post-write reconciliation, or fronting writes with a single mutation that does both reads and writes in one transaction (which we couldn't do here because we need `bcrypt` from the Node runtime, and the mutation runtime is V8).
+| Step | JWT | Session |
+| --- | --- | --- |
+| 1 | `currentStrategy.signOut()` deletes the cookie | Reads the cookie token, `fetchMutation(api.sessions.deleteByToken)` deletes the row, then deletes the cookie |
+| 2 | `redirect("/signin")` | same |
+| Effect on a stolen copy of the cookie | ⚠ Still valid until JWT `exp` (up to 7 days) | ✓ Immediately invalid — row is gone, next lookup returns null |
 
-8. **No `convex/auth.config.ts` / JWKS / `ConvexProviderWithAuth`.** Convex's `ctx.auth.getUserIdentity()` will always return `null` here. That means any *reactive client-side* Convex query cannot be scoped to the signed-in user — the trust boundary is one-way (Next.js → Convex). On `/dashboard` we sidestep this by server-rendering the tasks list via `fetchQuery`. **Real-world fix:** if you want reactive per-user client queries, switch to the JWKS-backed integration.
+### Cleanup (session strategy only)
 
-9. **No multi-factor auth, no OAuth providers, no remember-me, no device list, no session "log out everywhere" button.** Out of scope.
-
-10. **Single secret, no rotation.** `AUTH_SECRET` is the only key. Rotating it invalidates every existing session. Real systems use a key set (`kid` in the JWT header) so old tokens can verify while new ones use the new key.
+`convex/crons.ts` runs `internal.sessions.deleteExpired` every 24 hours. The mutation uses the `by_expiresAt` index to scan in batches of 100 (no `.filter()` — the project's Convex guidelines ban it), deletes them, and if it filled the batch re-schedules itself via `ctx.scheduler.runAfter(0, ...)` so a backlog gets drained without exceeding mutation transaction limits.
 
 ---
 
-## 9. Potential future improvements (in rough priority order)
+## 7. JWT vs Session — when to use which
 
-1. **DB-backed sessions** for revocation + "log out everywhere" + device-list UI.
-2. **Email verification** with a Convex action that sends the verification email and a `usersVerificationTokens` table.
-3. **Password reset** flow (same shape as #2).
-4. **Rate limiting** on `auth.signIn` and `auth.signUp` — Convex table-based counters.
-5. **Switch to Convex `auth.config.ts` + JWKS** so reactive client queries can be user-scoped. Requires generating an RS256 keypair, exposing `/.well-known/jwks.json` from a Next.js Route Handler, configuring `convex/auth.config.ts`, and wiring `ConvexProviderWithAuth`.
-6. **Refresh tokens with sliding expiry** for longer sessions without sacrificing security.
-7. **MFA (TOTP)** via `otpauth`.
-8. **OAuth providers** (Google, GitHub) — the same JWT/cookie pattern can layer underneath.
-9. **Audit log** of sign-in / sign-out / password change events.
-10. **Secret rotation** with a small key set indexed by `kid` in the JWT header.
+| Concern | JWT (stateless) | Session (stateful) |
+| --- | --- | --- |
+| Where the truth lives | The token itself | A row in the database |
+| Cost to verify | One signature check, CPU-only | One indexed DB read |
+| Server-side revocation | ❌ Token valid until `exp` | ✅ Delete the row, instant |
+| Sliding expiration | Requires reissuing on every request | Easy: bump `expiresAt` on read |
+| Force-logout-everywhere | Hard (needs a denylist) | Trivial: delete all rows for the user |
+| Reflect updated user data | After next sign-in | On the next request |
+| Survives a database outage | ✅ Yes | ❌ No, every request fails |
+| Works across services with no shared DB | ✅ Yes — verify the signature anywhere | ❌ Requires the DB |
+| Cookie size | Larger (200–500 bytes) | Smaller (~50 bytes) |
+| Bookkeeping | None | Daily cleanup cron |
+| Mental model | "Crypto-signed claim" | "Database-backed identity" |
+
+**Pick JWT when** the auth path needs to be cheap and stateless — high-traffic APIs, microservices that share an `AUTH_SECRET` but no DB, scenarios where a brief revocation lag is acceptable.
+
+**Pick session when** revocation matters — a "log out everywhere" button, an admin force-disabling an account, anything that needs the user-data-on-next-request behavior. This is what most traditional web apps (banking, SaaS dashboards) actually want.
+
+The professional libraries (NextAuth/Auth.js, Better Auth, Clerk, Supabase) default to **sessions** for exactly this reason. JWTs are more common in stateless APIs and the OAuth/OIDC world, where the issuer and the verifier are different services.
 
 ---
 
-## 10. Running it locally
+## 8. Security considerations
 
-**Prereqs:** Node 18+, the project's `node_modules/` installed, a Convex dev deployment provisioned (`npx convex dev` already run at least once so `_generated/` exists).
+| Concern | JWT mitigation | Session mitigation |
+| --- | --- | --- |
+| Token theft via XSS | `httpOnly` cookie | `httpOnly` cookie |
+| CSRF | `sameSite: lax` on the cookie + Server Actions are POST same-origin | same |
+| Brute-force password guessing | bcrypt cost 10 (~100ms per attempt) | same |
+| Account enumeration via timing | Dummy bcrypt compare on unknown email in `signIn` | same |
+| Account enumeration via error messages | Generic "Invalid email or password" | same |
+| Token forgery | HS256 verification with `AUTH_SECRET` | Token is 256-bit random; guessing is infeasible |
+| Replay after sign-out | ⚠ JWT remains valid until `exp` | ✓ Row deleted; token immediately rejected |
+| Token-mint-for-arbitrary-user | n/a (no such endpoint exists) | Prevented: session insert is wrapped inside `auth.signUp`/`signIn` which only run after password verification. There is **no** public `createSession({userId})` endpoint. |
+| Stale tokens accumulating | n/a | Daily cron sweep via `by_expiresAt` index |
+| Password hash leakage | `passwordHash` never leaves Convex; bcrypt compare runs inside the action | same |
+| Direct database access | `users.getByEmail`, `users.insertUser`, `sessions.insert`, `sessions.deleteExpired` are all `internal*` — unreachable from the public internet | same |
+| Validation | Zod parses every form payload at the Server Action boundary | same |
+| Transport | Cookie is `secure: true` in production | same |
+| Secret strength | `AUTH_SECRET` ≥ 32 chars validated at first use | n/a |
+
+---
+
+## 9. Drawbacks / known limitations
+
+| # | Limitation | Affects | Real-world fix |
+| --- | --- | --- | --- |
+| 1 | No revocation under JWT | jwt only | Switch to session strategy, or add a JWT denylist |
+| 2 | No refresh / sliding window | both | Issue a short access token + long refresh token (JWT) or bump `expiresAt` on read (session) |
+| 3 | No rate limiting on `auth.signIn`/`signUp` | both | Token-bucket counter keyed by IP in a Convex table |
+| 4 | No email verification | both | Send a tokenized link via a Convex action; gate sign-in on `emailVerifiedAt` |
+| 5 | No password reset | both | "Forgot password" flow with single-use reset token |
+| 6 | Email case is normalized at write | both | Acceptable; original case is lost |
+| 7 | Sign-up race window on duplicate email | both | Convex has no unique constraints; acceptable, near-zero in practice |
+| 8 | `ctx.auth.getUserIdentity()` returns null | both | Add `convex/auth.config.ts` + JWKS for client-reactive per-user queries |
+| 9 | Switching strategies invalidates all in-flight cookies | both | Intentional; communicated by bouncing users to `/signin` |
+| 10 | One indexed DB read per protected page render | session only | Cost of revocation; cache layer would defeat the point |
+| 11 | `AUTH_SECRET` is a single key, no rotation | jwt only | Add a `kid`-indexed key set |
+| 12 | No MFA, no OAuth, no remember-me, no device list | both | Out of scope |
+
+---
+
+## 10. Future improvements (priority order)
+
+1. Sliding expiry on the session strategy (bump `expiresAt` on every read).
+2. Email verification flow.
+3. Password reset flow.
+4. Rate limiting on sign-in / sign-up via a Convex `rateLimits` table.
+5. JWT refresh tokens for longer JWT-strategy sessions without losing security.
+6. Switch to Convex `auth.config.ts` + JWKS so reactive client-side Convex queries can be user-scoped.
+7. "Log out everywhere" button (only meaningful under session strategy; requires a `by_user` index).
+8. MFA (TOTP) via `otpauth`.
+9. OAuth providers (Google, GitHub) layered on the same cookie.
+10. Audit log of sign-in/out events.
+11. JWT secret rotation with a `kid`-indexed key set.
+
+---
+
+## 11. Running it locally
 
 ```powershell
-# 1. AUTH_SECRET in .env.local (already set by the assistant in this project).
+# 1. AUTH_SECRET in .env.local (already set; only used when AUTH_STRATEGY=jwt).
 #    Regenerate any time with:
 [Convert]::ToBase64String((1..32 | %{ Get-Random -Max 256 }))
 
-# 2. Keep Convex sync running in one terminal — it watches convex/*.ts and
-#    regenerates _generated/ as you edit:
+# 2. AUTH_STRATEGY in .env.local: `jwt` or `session`. Default `jwt`.
+
+# 3. Keep Convex sync running — it watches convex/*.ts and regenerates
+#    _generated/ as you edit:
 npx convex dev
 
-# 3. In a second terminal:
+# 4. In a second terminal:
 npm run dev
 ```
 
 Open <http://localhost:3000>.
 
-### End-to-end check
+### End-to-end check — JWT path
 
-1. `/` → "Sign in" and "Create account" CTAs.
-2. `/signup` → make `test@example.com` / `password123`. Auto-redirects to `/dashboard` greeting you by email and showing the tasks list.
-3. DevTools → Application → Cookies → `session` cookie present, `HttpOnly`, `SameSite=Lax`.
-4. Sign out → back to `/signin`. Manually visit `/dashboard` → bounced (`proxy.ts` catches it).
-5. Sign in with the wrong password → "Invalid email or password" inline error, no cookie set.
-6. Sign in with the right password → `/dashboard` again.
-7. Try signing up the same email twice → "Email already in use" inline error.
+1. `.env.local`: `AUTH_STRATEGY=jwt`. Restart dev.
+2. `/signup` → make `test@example.com` / `password123`. Auto-redirects to `/dashboard`.
+3. DevTools → Cookies → `session` value starts with `eyJ` (JWT header).
+4. Sign out → cookie gone, back to `/signin`.
+
+### End-to-end check — Session path
+
+1. `.env.local`: `AUTH_STRATEGY=session`. Restart dev.
+2. `/signup` → make `other@example.com` / `password123`.
+3. DevTools → Cookies → `session` is a ~43-char opaque string (no dots, no `eyJ`).
+4. In the Convex dashboard, open the `sessions` table — one row with that `token`.
+5. Sign out → that row is **gone** (refresh the Convex dashboard). Cookie is gone too.
+6. (Optional revocation check) Sign in fresh, copy the cookie value, sign in again in another browser — now delete the first row from the Convex dashboard. Reload the dashboard tab in the first browser → bounced to `/signin`. That's revocation working.
+
+### Flipping strategies
+
+Edit `.env.local`, change `AUTH_STRATEGY`, restart dev. Any browser with an old cookie sees one bounce to `/signin` on the next request, then can sign in fresh.
 
 ---
 
-## 11. Where to read what
+## 12. Where to read what
 
-If you want to understand the system, this is the reading order:
+If you want to understand the system, read in this order:
 
-1. **`src/lib/auth.ts`** — every primitive in one file. Zod, JWT, cookie config, DAL.
-2. **`src/app/actions.ts`** — three Server Actions that wire forms to those primitives + Convex.
-3. **`convex/auth.ts`** — bcrypt hashing and verifying inside Convex actions.
-4. **`convex/users.ts`** — the only direct DB code.
-5. **`src/proxy.ts`** — the optimistic guard.
-6. **`src/app/dashboard/page.tsx`** — the canonical protected route, showing how `requireSession()` + a Convex server-rendered query slot together.
+1. **`src/lib/auth-shared.ts`** — types, schemas, cookie config. The vocabulary both strategies use.
+2. **`src/lib/auth-jwt.ts`** — read this first; it's the simpler of the two and matches the JWT diagrams in this doc.
+3. **`src/lib/auth-session.ts`** — same shape, different verification path.
+4. **`src/lib/auth.ts`** — how the env var picks one and the DAL wraps it.
+5. **`src/app/actions.ts`** — three tiny Server Actions that delegate.
+6. **`convex/auth.ts`** — bcrypt + optional session insert, all in one Node action.
+7. **`convex/sessions.ts`** — internal CRUD + the cron's `deleteExpired` batching pattern.
+8. **`convex/crons.ts`** — the scheduling.
+9. **`src/proxy.ts`** — strategy-agnostic optimistic cookie check.
+10. **`src/app/dashboard/page.tsx`** — canonical protected route.
 
-If you can read those six files top-to-bottom, you understand the whole system.
+Twelve files. If you can read them top-to-bottom, you understand both strategies and how they're switched.
