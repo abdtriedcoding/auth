@@ -48,23 +48,34 @@ export const currentStrategy: SessionStrategy =
   AUTH_STRATEGY === "session" ? sessionStrategy : jwtStrategy;
 
 /**
- * The DAL — the call protected pages make to learn who is signed in.
+ * Returns the current session, or null if the visitor isn't signed in.
+ *
+ * Named to match the convention in NextAuth/Auth.js (`auth()` / Better
+ * Auth's `getSession()`) — it's the one helper protected pages, Server
+ * Actions, and Route Handlers reach for to learn who is signed in.
+ *
  * Wrapped in React `cache()` so the work happens at most once per render
  * even if both the layout and the page call it.
  *
  * Fails closed for every kind of failure (no cookie, expired, bad
  * signature, deleted user, stale value from a strategy flip).
  */
-export const verifySession = cache(async (): Promise<SessionPayload | null> => {
+export const getSession = cache(async (): Promise<SessionPayload | null> => {
   return currentStrategy.getSession();
 });
 
 /**
- * For Server Components that REQUIRE a signed-in user. `redirect()`
+ * Same as `getSession()` but redirects to /signin when not signed in,
+ * so callers can rely on a non-null return.
+ *
+ * Use in Server Components that REQUIRE a signed-in user. `redirect()`
  * throws a NEXT_REDIRECT error — never wrap this call in try/catch.
+ *
+ * Naming mirrors common conventions (`requireAuth` / `requireUser` in
+ * Better Auth- and Lucia-style codebases).
  */
-export async function requireSession(): Promise<SessionPayload> {
-  const session = await verifySession();
+export async function requireAuth(): Promise<SessionPayload> {
+  const session = await getSession();
   if (!session) redirect("/signin");
   return session;
 }

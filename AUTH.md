@@ -21,8 +21,8 @@ Switching is a one-line edit to `.env.local` + a dev-server restart. The rest of
 | JWT strategy | `src/lib/auth-jwt.ts` — `jose` HS256 token in an `httpOnly` cookie, 7-day expiry |
 | Session strategy | `src/lib/auth-session.ts` — opaque 32-byte random token in cookie, row in `sessions` table |
 | Strategy switch | `AUTH_STRATEGY` env var, validated at module load in `src/lib/auth.ts` |
-| Session retrieval | `verifySession()` DAL — delegates to `currentStrategy.getSession()`, wrapped in React `cache()` |
-| Protected routes | `requireSession()` on the page + optimistic cookie-presence check in `src/proxy.ts` |
+| Session retrieval | `getSession()` DAL — delegates to `currentStrategy.getSession()`, wrapped in React `cache()` |
+| Protected routes | `requireAuth()` on the page + optimistic cookie-presence check in `src/proxy.ts` |
 | Password hashing | `bcryptjs`, cost factor 10, runs inside a Convex Node action |
 | Validation | `zod` schemas at the Server Action boundary |
 | User persistence | `users` table in Convex with a `by_email` index |
@@ -37,7 +37,7 @@ Switching is a one-line edit to `.env.local` + a dev-server restart. The rest of
 src/
   lib/
     auth.ts                  # entry point: picks strategy from env, re-exports
-                             # verifySession + requireSession
+                             # getSession + requireAuth
     auth-shared.ts           # types, Zod schemas, cookie config, getSecret —
                              # shared by both strategies, lives in its own
                              # file to avoid a circular import
@@ -152,7 +152,7 @@ Read at module load by `src/lib/auth.ts`. Unknown values throw immediately — f
 | `src/app/dashboard/page.tsx` and all protected pages | No change |
 | Cookie name | Still `session` |
 | Cookie *contents* | JWT string → 43-char opaque token |
-| What runs on `verifySession()` | `jose.jwtVerify(token, AUTH_SECRET)` → one Convex query |
+| What runs on `getSession()` | `jose.jwtVerify(token, AUTH_SECRET)` → one Convex query |
 | Sign-out | Cookie delete only → cookie delete + DB row delete |
 | Revocation | None → immediate |
 | `sessions` table | Unused → one row per active session, daily cleanup cron |
@@ -180,14 +180,14 @@ To switch: edit `.env.local`, restart `npm run dev`.
 
 | Step | JWT | Session |
 | --- | --- | --- |
-| 1 | Page calls `requireSession()` → `verifySession()` → `currentStrategy.getSession()` | same |
+| 1 | Page calls `requireAuth()` → `getSession()` → `currentStrategy.getSession()` | same |
 | 2 | Read `session` cookie | same |
 | 3 | `jose.jwtVerify(token, AUTH_SECRET)` — **CPU only, no I/O** | `fetchQuery(api.sessions.getByToken, { token })` — **one indexed Convex read** |
 | 4 | Return `{userId, email}` from JWT payload, or `null` on any verification failure | Returns `{userId, email}` from the joined sessions+users row, or `null` if not found / expired / user deleted |
 
 This is the **central trade-off**: JWT reads zero rows; session reads one row, every page.
 
-React `cache()` dedupes per render — calling `verifySession()` from the layout AND the page only runs the cookie/verify path once.
+React `cache()` dedupes per render — calling `getSession()` from the layout AND the page only runs the cookie/verify path once.
 
 ### Sign-out
 

@@ -1,13 +1,13 @@
 import { fetchQuery } from "convex/nextjs";
-import { requireSession } from "@/lib/auth";
+import { requireAuth } from "@/lib/auth";
 import { api } from "../../../convex/_generated/api";
 import { SignOutButton } from "./sign-out-button";
 
 export default async function DashboardPage() {
-  // The DAL call. `requireSession` either returns a verified session or
+  // The DAL call. `requireAuth` either returns a verified session or
   // calls redirect('/signin'). proxy.ts already bounced out obvious
   // unauthenticated requests; this is the security boundary.
-  const { email } = await requireSession();
+  const { email } = await requireAuth();
 
   // Server-rendered Convex call. No client subscription here — the page is
   // re-fetched on navigation, which is enough for a tasks list demo.

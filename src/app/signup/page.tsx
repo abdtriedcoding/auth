@@ -1,10 +1,10 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
-import { verifySession } from "@/lib/auth";
+import { getSession } from "@/lib/auth";
 import { SignUpForm } from "./form";
 
 export default async function SignUpPage() {
-  if (await verifySession()) redirect("/dashboard");
+  if (await getSession()) redirect("/dashboard");
 
   return (
     <div className="flex flex-1 items-center justify-center px-6 py-16">

@@ -6,7 +6,7 @@
  *
  * This is an *optimistic* check: we only look at whether the session cookie
  * is present, not whether the JWT inside it is valid. The signature check
- * happens later in `verifySession()` on the actual page. The point of the
+ * happens later in `getSession()` on the actual page. The point of the
  * proxy is UX — bouncing obviously-logged-out users to /signin without
  * having to spin up a Server Component first.
  */
